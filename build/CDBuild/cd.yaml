@@ -1,0 +1,145 @@
+trigger:
+- master
+- main
+
+pool:
+  name: Self Hosted
+
+parameters:
+  - name: stages
+    type: object
+    default:
+      - stage: Current
+        bcVersion: latest
+      - stage: NextMajor
+        bcVersion: nextMinor
+      - stage: NextMinor
+        bcVersion: nextMajor
+
+stages:
+  - ${{ each stage in parameters.stages }}:
+    - stage: Build${{ stage.stage }}
+      displayName: "Build ${{ stage.stage }}"
+      dependsOn: []
+      variables:
+        - name: bcVersion
+          value: ${{ stage.bcVersion }}
+
+      jobs:
+        - job:
+          displayName: "${{ stage.stage }}"
+          steps:
+            - checkout: self
+              persistCredentials: true
+
+            - task: InstallBcContainerHelper@0
+              displayName: 'Install BC Container Helper'
+
+            - task: AppVersioning@0
+              displayName: 'Set Version Number'
+              condition: succeeded()
+              inputs:
+                onlyUpdateOnChangedSource: true
+                versioningSchema: major.minor.build.no-of-commits
+              env:
+                AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+            - task: CreateBuildContainer@0
+              displayName: 'Create Build Container'
+              condition: succeeded()
+              inputs:
+                bcType: 'sandbox'
+                bcVersion: ${{ stage.bcVersion }}
+                bcCountryVersion: 'w1'
+                avoidCDNDownload: true
+
+            - task: DownloadArtifactsUniversalFeed@0
+              displayName: 'Download & Deploy Extension License Dependency'
+              condition: succeeded()
+              inputs:
+                organization: '$(System.TeamFoundationCollectionUri)'
+                feed: 'Products'
+                name: '365_business_development_extension_license'
+                version: '*'
+                symbolsFolder: '$(Agent.TempDirectory)\.alpackages'
+              env:
+                AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+            - task: Compile@0
+              displayName: 'Compile'
+              condition: succeeded()
+              inputs:
+                createNugetPackage: true
+
+            - task: SignApp@0
+              displayName: 'Sign'
+              condition: succeeded()
+              inputs:
+                artifactsDirectory: '$(Build.ArtifactStagingDirectory)'
+                signingAzureKeyVaultUrl: '$(keyVaultUrl)'
+                signingAzureKeyVaultTenantId: '$(tenantId)'
+                signingAzureKeyVaultClientId: '$(certificateClientId)'
+                signingAzureKeyVaultClientSecret: '$(certificateClientSecret)'
+                signingCertName: '$(certificateName)'
+
+            - task: Install@0
+              displayName: 'Install'
+              condition: succeeded()
+              inputs:
+                schemaUpdateMode: 'Synchronize'
+
+            - task: RunTests@0
+              displayName: 'Run Tests'
+              condition: succeeded()
+
+            - task: PublishTestResults@2
+              displayName: 'Publish Test Results'
+              condition: succeeded()
+              inputs:
+                testResultsFormat: XUnit
+                testResultsFiles: TestResults.xml
+                failTaskOnFailedTests: true
+
+            - task: RemoveBuildContainer@0
+              displayName: 'Remove Build Container'
+              condition: always()
+
+            - ${{ if eq(stage.bcVersion, 'latest') }}:
+
+              - task: PublishBuildArtifacts@1
+                displayName: 'Publish Artifacts'
+                condition: and(succeeded(), eq(variables.isPullRequestBuild, true))
+                inputs:
+                  PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+                  ArtifactName: output
+
+              - task: NuGetCommand@2
+                displayName: 'Publish Artifacts to NuGet feed'
+                continueOnError: true
+                condition: and(succeeded(), eq(variables.isPullRequestBuild, true))
+                inputs:
+                  command: 'push'
+                  packagesToPush: '$(Build.ArtifactStagingDirectory)/**/*.nupkg;!$(Build.ArtifactStagingDirectory)/**/*.symbols.nupkg'
+                  nuGetFeedType: 'internal'
+                  publishVstsFeed: 'f4e0cb78-8f02-4f52-8194-a606c283777d/1e0f8915-4b60-4055-9c42-728858b87b64'
+                  allowPackageConflicts: true
+
+              - task: UniversalPackages@0
+                displayName: 'Publish Artifacts to Azure Feed (Universal)'
+                continueOnError: true
+                condition: and(succeeded(), eq(variables.isPullRequestBuild, true))
+                inputs:
+                  command: publish
+                  publishDirectory: '$(Build.ArtifactStagingDirectory)'
+                  vstsFeedPublish: 'Dynamics 365 Business Central ISV Solutions/Products'
+                  vstsFeedPackagePublish: '$(appName)'
+                  packagePublishDescription: '$(appDescription)'
+                  versionOption: custom
+                  versionPublish: '$(appVersion).$(appBuild)'
+
+              - script: |
+                    git tag $(appVersion)
+                    git push origin --tags
+                workingDirectory: $(Build.SourcesDirectory)
+                displayName: 'Tag Source'
+                condition: and(succeeded(),ne(variables['appVersion'],''))
